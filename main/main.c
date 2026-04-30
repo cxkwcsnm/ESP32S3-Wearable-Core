@@ -1,40 +1,38 @@
 #include <stdio.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
 
 #include "GetBatteryLevel.h"
-
-// ========== app_main 入口 ==========
+#include "OLED_driver.h"
+#include "OLED_Data.h"
 void app_main(void)
 {
     // 1. 初始化
     ESP_ERROR_CHECK(battery_adc_init());
+    ESP_ERROR_CHECK(oled_init(I2C_NUM_0, GPIO_NUM_20, GPIO_NUM_21));
 
     // 2. 循环读取
     while (1)
     {
-        uint32_t adc_raw;
-        esp_err_t ret = battery_adc_read(&adc_raw);
-        float average_voltage = 0;
-        int times = 10; // 读取次数
-        while (times--)
-        {
+        float voltage = 0.0f;
+        battery_get_average_voltage(5, &voltage); // 采样 5 次，获取平均电压
+        ESP_LOGI(TAG, "平均电压: %.2f V", voltage);
 
-            if (ret == ESP_OK)
-            {
-                average_voltage += (float)adc_raw * 3.3f / 4095.0f;
-            }
-        }
-        average_voltage /= 10.0f;
+        char voltage_str[20];
+        snprintf(voltage_str, sizeof(voltage_str), "%.2f V", voltage);
 
-        if (ret == ESP_OK)
-        {
+        oled_clear();
+        oled_show_string(0, 0, "Voltage:");
+        oled_show_string(48, 0, voltage_str);
 
-            ESP_LOGI("BATTERY", "ADC: %lu → 电压: %.2f V", adc_raw, average_voltage / VOLTAGE_DIVIDER_RATIO); // 注意：如果有分压电路，需除以分压比
-        }
+        // 使用 oled_draw_image 显示电池图标
+        oled_draw_image(100, 0, battery_pattern(voltage), 19, 8);
 
-        vTaskDelay(1000 / portTICK_PERIOD_MS); // 1秒一次
+        oled_refresh();
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // 延时 1 秒
     }
 }

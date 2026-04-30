@@ -1,4 +1,22 @@
 {
-    "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.4/",
-    "C_Cpp.errorSquiggles": "enabled"
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM8",
+  "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.4/",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "D:\\Espressif\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\esp32s3_project\\sample_project\\build"
+  ],
+  "idf.flashType": "UART",
+  "C_Cpp.default.compilerPath": "D:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe",
+  "chat.tools.terminal.autoApprove": {
+    "idf.py": true
+  }
 }

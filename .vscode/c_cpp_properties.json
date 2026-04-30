@@ -1,22 +1,22 @@
 {
     "configurations": [
         {
-            "name": "Win32",
+            "name": "ESP-IDF",
+            "compilerPath": "D:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe",
+            "compileCommands": [
+                "${config:idf.buildPath}/compile_commands.json"
+            ],
             "includePath": [
                 "${workspaceFolder}/**",
-                "G:\\github\\ESP32-ADC\\components\\Middlewares\\**",
-                "D:\\Espressif\\**"
+                "D:/Espressif/frameworks/esp-idf-v5.4/**",
+                "D:/Espressif/tools/**"
             ],
-            "defines": [
-                "_DEBUG",
-                "UNICODE",
-                "_UNICODE"
-            ],
-            "windowsSdkVersion": "8.1",
-            "compilerPath": "cl.exe",
-            "cStandard": "c17",
-            "cppStandard": "c++17",
-            "intelliSenseMode": "windows-msvc-x64"
+            "browse": {
+                "path": [
+                    "${workspaceFolder}"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
         }
     ],
     "version": 4
