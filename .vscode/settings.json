@@ -1,3 +1,4 @@
 {
-    "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.4/"
+    "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.4/",
+    "C_Cpp.errorSquiggles": "enabled"
 }
