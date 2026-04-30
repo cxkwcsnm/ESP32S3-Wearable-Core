@@ -1,5 +1,0 @@
-CompileFlags:
-  Remove: [-f*, -m*]
-
-Diagnostics:
-  UnusedIncludes: None
