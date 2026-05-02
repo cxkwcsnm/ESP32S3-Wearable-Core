@@ -27,7 +27,7 @@ esp_err_t battery_adc_init(void)
 
     // 2️⃣ 配置通道参数（分辨率 + 衰减）
     adc_oneshot_chan_cfg_t chan_config = {
-        .atten = ADC_ATTEN_DB_11,    // 11dB 衰减 → 最大测量 ~3.1V
+        .atten = ADC_ATTEN_DB_12,    // 12dB 衰减 → 最大测量 ~3.9V
         .bitwidth = ADC_BITWIDTH_12, // 12位分辨率 → 0~4095
     };
     
