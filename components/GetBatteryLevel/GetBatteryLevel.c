@@ -103,7 +103,7 @@ esp_err_t battery_get_average_voltage(int samples, float *out_voltage)
         } else {
             ESP_LOGW(TAG, "采样 %d 失败: %s", i, esp_err_to_name(ret));
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);  // 短暂延迟，避免采样过快
+        vTaskDelay(100 / portTICK_PERIOD_MS);  // 短暂延迟，避免采样过快
     }
 
     if (valid_samples == 0) {
