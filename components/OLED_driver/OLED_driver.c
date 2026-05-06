@@ -23,7 +23,7 @@ static esp_err_t oled_i2c_write_raw(const uint8_t *data, size_t len, uint8_t con
     write_buf[0] = control;
     memcpy(&write_buf[1], data, len);
 
-    esp_err_t err = myiic_write(s_oled_dev_handle, write_buf, len + 1);
+    esp_err_t err = myiic_write(s_oled_dev_handle, OLED_ADDR, write_buf, len + 1);
 
     free(write_buf);
     return err;
