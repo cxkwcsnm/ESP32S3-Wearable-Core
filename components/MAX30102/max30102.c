@@ -63,27 +63,27 @@ esp_err_t Max30102_Init(void)
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 配置 FIFO
-    ret = Max30102_Write_Reg(REG_FIFO_CONFIG, 0x0F);
+    // 配置 FIFO (16样本深度)
+    ret = Max30102_Write_Reg(REG_FIFO_CONFIG, 0x1F);
     if (ret != ESP_OK)
         return ret;
 
-    // 配置模式为 SpO2
+    // 配置模式为 SpO2 + HR
     ret = Max30102_Write_Reg(REG_MODE_CONFIG, 0x03);
     if (ret != ESP_OK)
         return ret;
 
-    // 配置 SpO2 采样率和LED脉冲宽度
-    ret = Max30102_Write_Reg(REG_SPO2_CONFIG, 0x27); // 100Hz, 16-bit, 411us
+    // 配置 SpO2 采样率和分辨率: 100Hz, 200us LED pulse, 18-bit resolution
+    ret = Max30102_Write_Reg(REG_SPO2_CONFIG, 0x27);
     if (ret != ESP_OK)
         return ret;
 
-    // 设置 LED 电流
-    ret = Max30102_Write_Reg(REG_LED1_PA, 0x24); // 红色 LED
+    // 设置 LED 电流 (较高电流提高信号质量)
+    ret = Max30102_Write_Reg(REG_LED1_PA, 0x1F); // 红色 LED: 50mA
     if (ret != ESP_OK)
         return ret;
 
-    ret = Max30102_Write_Reg(REG_LED2_PA, 0x24); // IR LED
+    ret = Max30102_Write_Reg(REG_LED2_PA, 0x1F); // IR LED: 50mA
     if (ret != ESP_OK)
         return ret;
 
@@ -102,6 +102,26 @@ esp_err_t Max30102_Write_Reg(uint8_t reg, uint8_t data)
 esp_err_t Max30102_Read_Reg(uint8_t reg, uint8_t *data)
 {
     return myiic_write_read(max30102_dev, MAX30102_ADDR, &reg, 1, data, 1);
+}
+
+// 读取FIFO中可用的样本数
+static int Max30102_Get_Fifo_Count(void)
+{
+    uint8_t wr_ptr, rd_ptr, ovf;
+
+    if (Max30102_Read_Reg(REG_FIFO_WR_PTR, &wr_ptr) != ESP_OK)
+        return 0;
+    if (Max30102_Read_Reg(REG_FIFO_RD_PTR, &rd_ptr) != ESP_OK)
+        return 0;
+    if (Max30102_Read_Reg(REG_OVF_COUNTER, &ovf) != ESP_OK)
+        return 0;
+
+    // 计算FIFO中可用样本数
+    int count = wr_ptr - rd_ptr;
+    if (count < 0)
+        count += 32; // FIFO深度为32
+
+    return count;
 }
 
 // 读 FIFO
@@ -390,8 +410,14 @@ void Max30102_Algorithm_Calculate(uint32_t *ir_buffer, int32_t buffer_len, uint3
 
     if (n_middle_idx > 1)
         n_ratio_average = (an_ratio[n_middle_idx - 1] + an_ratio[n_middle_idx]) / 2;
-    else
+    else if (n_middle_idx >= 0 && n_i_ratio_count > 0)
         n_ratio_average = an_ratio[n_middle_idx];
+    else
+    {
+        *spo2 = -999;
+        *spo2_valid = 0;
+        return;
+    }
 
     if (n_ratio_average > 2 && n_ratio_average < 184)
     {
@@ -429,63 +455,79 @@ void Max30102_Task(void *pvParameters)
 
     ESP_LOGI(TAG, "MAX30102 任务启动");
 
-    uint8_t fifo_buffer[6];
+    uint8_t fifo_buffer[96]; // 最多读取16个样本（每个样本6字节）
     int32_t spo2 = 0, heart_rate = 0;
     int8_t spo2_valid = 0, hr_valid = 0;
 
     while (1)
     {
-        ret = Max30102_Read_Fifo(fifo_buffer, 6);
-        if (ret == ESP_OK)
+        // 获取FIFO中可用的样本数
+        int sample_count = Max30102_Get_Fifo_Count();
+
+        if (sample_count > 0)
         {
-            // 解析数据：IR 和 RED 各 3 字节
-            uint32_t ir_value = ((uint32_t)fifo_buffer[0] << 16) |
-                                ((uint32_t)fifo_buffer[1] << 8) |
-                                (uint32_t)fifo_buffer[2];
-            uint32_t red_value = ((uint32_t)fifo_buffer[3] << 16) |
-                                 ((uint32_t)fifo_buffer[4] << 8) |
-                                 (uint32_t)fifo_buffer[5];
+            // 限制单次读取的样本数
+            if (sample_count > 16)
+                sample_count = 16;
 
-            // 存储到缓冲区
-            ir_buffer[buffer_idx] = ir_value;
-            red_buffer[buffer_idx] = red_value;
-            buffer_idx++;
-
-            // 缓冲区满时计算
-            if (buffer_idx >= MAX30102_BUFFER_SIZE)
+            ret = Max30102_Read_Fifo(fifo_buffer, sample_count * 6);
+            if (ret == ESP_OK)
             {
-                Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
-                                             &spo2, &spo2_valid, &heart_rate, &hr_valid);
-
-                if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
+                // 解析所有读取的样本
+                for (int s = 0; s < sample_count; s++)
                 {
-                    last_heart_rate = (uint32_t)heart_rate;
-                    ESP_LOGI(TAG, "心率: %" PRIu32 " bpm", last_heart_rate);
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "心率无效: %ld", heart_rate);
-                }
+                    int offset = s * 6;
+                    uint32_t ir_value = ((uint32_t)fifo_buffer[offset] << 16) |
+                                        ((uint32_t)fifo_buffer[offset + 1] << 8) |
+                                        (uint32_t)fifo_buffer[offset + 2];
+                    uint32_t red_value = ((uint32_t)fifo_buffer[offset + 3] << 16) |
+                                         ((uint32_t)fifo_buffer[offset + 4] << 8) |
+                                         (uint32_t)fifo_buffer[offset + 5];
 
-                if (spo2_valid && spo2 >= 0)
-                {
-                    last_spo2 = (uint32_t)spo2;
-                    ESP_LOGI(TAG, "血氧: %" PRIu32 "%%", last_spo2);
+                    // 存储到缓冲区（循环缓冲）
+                    ir_buffer[buffer_idx] = ir_value;
+                    red_buffer[buffer_idx] = red_value;
+                    buffer_idx = (buffer_idx + 1) % MAX30102_BUFFER_SIZE;
                 }
-                else
-                {
-                    ESP_LOGW(TAG, "血氧无效: %ld", spo2);
-                }
-
-                // 通过消息队列发送心率数据
-                Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
-
-                buffer_idx = 0;
+            }
+            else
+            {
+                ESP_LOGE(TAG, "读取 FIFO 失败: %d", ret);
             }
         }
-        else
+
+        // 缓冲区填满后进行计算
+        static int calc_count = 0;
+        calc_count += sample_count;
+        if (calc_count >= MAX30102_BUFFER_SIZE)
         {
-            ESP_LOGE(TAG, "读取 FIFO 失败: %d", ret);
+            calc_count = 0;
+
+            Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
+                                         &spo2, &spo2_valid, &heart_rate, &hr_valid);
+
+            if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
+            {
+                last_heart_rate = (uint32_t)heart_rate;
+                ESP_LOGI(TAG, "心率: %" PRIu32 " bpm", last_heart_rate);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "心率无效: %ld", heart_rate);
+            }
+
+            if (spo2_valid && spo2 >= 0)
+            {
+                last_spo2 = (uint32_t)spo2;
+                ESP_LOGI(TAG, "血氧: %" PRIu32 "%%", last_spo2);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "血氧无效: %ld", spo2);
+            }
+
+            // 通过消息队列发送心率数据
+            Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));

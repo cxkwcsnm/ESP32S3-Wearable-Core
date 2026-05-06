@@ -15,7 +15,7 @@ void OLEDShowTask(void *pvParameters)
         oled_clear_buffer();
         oled_show_string(0, 0, RTC_get_HH_MM_SS()); // 显示当前时分秒
 
-        oled_show_string(0, 3, "Voltage:");
+        oled_show_string(0, 3, "V:  ");
         oled_show_string(48, 3, voltage_str);
 
         uint32_t heart_rate = Max30102_Get_Heart_Rate();
@@ -28,8 +28,21 @@ void OLEDShowTask(void *pvParameters)
         {
             snprintf(heart_rate_str, sizeof(heart_rate_str), "-- bpm");
         }
-        oled_show_string(0, 4, "Heart Rate:");
+        oled_show_string(0, 4, "HR:  ");
         oled_show_string(64, 4, heart_rate_str);
+
+        uint32_t spo2 = Max30102_Get_Spo2();
+        char spo2_str[15];
+        if (spo2 > 0 && spo2 <= 100)
+        {
+            snprintf(spo2_str, sizeof(spo2_str), "%lu%%", spo2);
+        }
+        else
+        {
+            snprintf(spo2_str, sizeof(spo2_str), "--%%");
+        }
+        oled_show_string(0, 5, "SPO2: ");
+        oled_show_string(64, 5, spo2_str);
 
         
         if (wifi_is_connected())

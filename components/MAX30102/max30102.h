@@ -42,6 +42,7 @@ esp_err_t Max30102_Init(void);
 esp_err_t Max30102_Write_Reg(uint8_t reg, uint8_t data);
 esp_err_t Max30102_Read_Reg(uint8_t reg, uint8_t *data);
 esp_err_t Max30102_Read_Fifo(uint8_t *buffer, uint8_t count);
+
 uint32_t Max30102_Get_Heart_Rate(void);
 uint32_t Max30102_Get_Spo2(void);
 
