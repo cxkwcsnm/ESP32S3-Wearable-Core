@@ -1,400 +1,493 @@
 #include "max30102.h"
 
 static const char *TAG = "MAX30102";
+
 static i2c_master_dev_handle_t max30102_dev = NULL;
 
-static uint32_t aun_ir_buffer[IR_BUF_LEN];
-static uint32_t aun_red_buffer[RED_BUF_LEN];
-static int32_t n_spo2;
-static int8_t ch_spo2_valid;
-static int32_t n_heart_rate;
-static int8_t ch_hr_valid;
+// 数据缓存
+static uint32_t ir_buffer[MAX30102_BUFFER_SIZE] = {0};
+static uint32_t red_buffer[MAX30102_BUFFER_SIZE] = {0};
+static int buffer_idx = 0;
 
+// 计算结果缓存
+static uint32_t last_heart_rate = 0;
+static uint32_t last_spo2 = 0;
+
+// 算法相关常量
+#define BUFFER_SIZE 500
+#define MA4_SIZE 4
+#define HAMMING_SIZE 11
+
+static int32_t an_x[BUFFER_SIZE];
+static int32_t an_y[BUFFER_SIZE];
+static int32_t an_dx[BUFFER_SIZE];
+static int32_t an_dx_peak_locs[15];
+static uint32_t auw_hamm[HAMMING_SIZE] = {7, 28, 67, 124, 189, 232, 232, 189, 124, 67, 28};
+
+// SpO2 lookup table (184 elements for ratio 0-183)
+static const uint8_t uch_spo2_table[184] = {
+    95, 95, 95, 96, 96, 96, 97, 97, 97, 97, 98, 98, 98, 98, 99, 99, 99, 99, 100, 100,
+    100, 100, 100, 100, 100, 100, 99, 99, 99, 99, 99, 99, 99, 99, 98, 98, 98, 98, 98, 98,
+    98, 97, 97, 97, 97, 97, 97, 97, 96, 96, 96, 96, 96, 96, 95, 95, 95, 95, 95, 94,
+    94, 94, 94, 94, 93, 93, 93, 93, 93, 92, 92, 92, 92, 91, 91, 91, 91, 90, 90, 90,
+    89, 89, 89, 89, 88, 88, 88, 87, 87, 87, 86, 86, 86, 85, 85, 85, 84, 84, 84, 83,
+    83, 83, 82, 82, 81, 81, 81, 80, 80, 79, 79, 79, 78, 78, 77, 77, 76, 76, 76, 75,
+    75, 74, 74, 73, 73, 72, 72, 71, 71, 70, 70, 69, 69, 68, 68, 67, 67, 66, 66, 65,
+    65, 64, 64, 63, 62, 62, 61, 61, 60, 60, 59, 59, 58, 58, 57, 56, 56, 55, 55, 54,
+    54, 53, 52, 52, 51, 51, 50, 49, 49, 48, 48, 47, 47, 46, 45, 45, 44, 44, 43, 42};
+
+// 初始化
 esp_err_t Max30102_Init(void)
 {
-    ESP_ERROR_CHECK(myiic_add_device(MAX30102_ADDR, &max30102_dev));
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "初始化 MAX30102");
+
+    // 添加设备
+    ret = myiic_add_device(MAX30102_ADDR, &max30102_dev);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "添加 MAX30102 设备失败");
+        return ret;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    Max30102_Write_Reg(REG_MODE_CONFIG, 0x40);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    Max30102_Write_Reg(REG_INTR_ENABLE_1, 0xC0);
-    Max30102_Write_Reg(REG_INTR_ENABLE_2, 0x00);
-    Max30102_Write_Reg(REG_FIFO_WR_PTR, 0x00);
-    Max30102_Write_Reg(REG_OVF_COUNTER, 0x00);
-    Max30102_Write_Reg(REG_FIFO_RD_PTR, 0x00);
-    Max30102_Write_Reg(REG_FIFO_CONFIG, 0x0F);
-    Max30102_Write_Reg(REG_MODE_CONFIG, 0x03);
-    Max30102_Write_Reg(REG_SPO2_CONFIG, 0x27);
-    Max30102_Write_Reg(REG_LED1_PA, 0x24);
-    Max30102_Write_Reg(REG_LED2_PA, 0x24);
-    Max30102_Write_Reg(REG_PILOT_PA, 0x7f);
+    // 重置设备
+    ret = Max30102_Write_Reg(REG_MODE_CONFIG, 0x40);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "重置设备失败");
+        return ret;
+    }
 
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 配置 FIFO
+    ret = Max30102_Write_Reg(REG_FIFO_CONFIG, 0x0F);
+    if (ret != ESP_OK)
+        return ret;
+
+    // 配置模式为 SpO2
+    ret = Max30102_Write_Reg(REG_MODE_CONFIG, 0x03);
+    if (ret != ESP_OK)
+        return ret;
+
+    // 配置 SpO2 采样率和LED脉冲宽度
+    ret = Max30102_Write_Reg(REG_SPO2_CONFIG, 0x27); // 100Hz, 16-bit, 411us
+    if (ret != ESP_OK)
+        return ret;
+
+    // 设置 LED 电流
+    ret = Max30102_Write_Reg(REG_LED1_PA, 0x24); // 红色 LED
+    if (ret != ESP_OK)
+        return ret;
+
+    ret = Max30102_Write_Reg(REG_LED2_PA, 0x24); // IR LED
+    if (ret != ESP_OK)
+        return ret;
+
+    ESP_LOGI(TAG, "MAX30102 初始化完成");
     return ESP_OK;
 }
 
+// 写寄存器
 esp_err_t Max30102_Write_Reg(uint8_t reg, uint8_t data)
 {
     uint8_t buf[2] = {reg, data};
     return myiic_write(max30102_dev, MAX30102_ADDR, buf, 2);
 }
 
+// 读寄存器
 esp_err_t Max30102_Read_Reg(uint8_t reg, uint8_t *data)
 {
     return myiic_write_read(max30102_dev, MAX30102_ADDR, &reg, 1, data, 1);
 }
 
+// 读 FIFO
 esp_err_t Max30102_Read_Fifo(uint8_t *buffer, uint8_t count)
 {
     uint8_t reg_addr = REG_FIFO_DATA;
     return myiic_write_read(max30102_dev, MAX30102_ADDR, &reg_addr, 1, buffer, count);
 }
 
+// 获取心率
 uint32_t Max30102_Get_Heart_Rate(void)
 {
-    return n_heart_rate;
+    return last_heart_rate;
 }
 
+// 获取血氧
 uint32_t Max30102_Get_Spo2(void)
 {
-    return n_spo2;
+    return last_spo2;
 }
 
-static float max30102_calculate_spo2(float *ir_data, float *red_data, uint16_t count)
+// 算法排序函数（升序）
+static void maxim_sort_ascend(int32_t *pn_x, int32_t n_size)
 {
-    float ir_max = *ir_data, ir_min = *ir_data;
-    float red_max = *red_data, red_min = *red_data;
-
-    for (uint16_t i = 1; i < count; i++)
+    int32_t i, j, n_temp;
+    for (i = 1; i < n_size; i++)
     {
-        ir_max = ir_data[i] > ir_max ? ir_data[i] : ir_max;
-        ir_min = ir_data[i] < ir_min ? ir_data[i] : ir_min;
-        red_max = red_data[i] > red_max ? red_data[i] : red_max;
-        red_min = red_data[i] < red_min ? red_data[i] : red_min;
+        n_temp = pn_x[i];
+        for (j = i; j > 0 && n_temp < pn_x[j - 1]; j--)
+            pn_x[j] = pn_x[j - 1];
+        pn_x[j] = n_temp;
     }
-
-    float ir_range = ir_max - ir_min;
-    float red_range = red_max - red_min;
-    float ir_sum = ir_max + ir_min;
-    float red_sum = red_max + red_min;
-
-    if (ir_range < 1e-6 || red_sum < 1e-6)
-    {
-        return -1.0f;
-    }
-
-    float R = (ir_sum * red_range) / (red_sum * ir_range);
-    return (-45.060f * R * R) + (30.354f * R) + 94.845f;
 }
 
-static void find_peaks(int32_t *locs, int32_t *npks, int32_t *x, int32_t size, int32_t min_h, int32_t min_d, int32_t max_n)
+// 算法排序函数（降序索引）
+static void maxim_sort_indices_descend(int32_t *pn_x, int32_t *pn_indx, int32_t n_size)
 {
-    int32_t i = 1, count = 0;
-    int32_t temp_locs[15] = {0};
-
-    while (i < size - 1 && count < 15)
+    int32_t i, j, n_temp;
+    for (i = 1; i < n_size; i++)
     {
-        if (x[i] > min_h && x[i] > x[i - 1] && x[i] > x[i + 1])
-        {
-            temp_locs[count++] = i;
-            while (i < size - 1 && x[i] >= x[i + 1])
-                i++;
-        }
-        i++;
+        n_temp = pn_indx[i];
+        for (j = i; j > 0 && pn_x[n_temp] > pn_x[pn_indx[j - 1]]; j--)
+            pn_indx[j] = pn_indx[j - 1];
+        pn_indx[j] = n_temp;
     }
+}
 
-    for (i = 1; i < count; i++)
-    {
-        for (int32_t j = i; j > 0 && x[temp_locs[j]] > x[temp_locs[j - 1]]; j--)
-        {
-            int32_t temp = temp_locs[j];
-            temp_locs[j] = temp_locs[j - 1];
-            temp_locs[j - 1] = temp;
-        }
-    }
+// 找峰值
+static void maxim_peaks_above_min_height(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x, int32_t n_size, int32_t n_min_height)
+{
+    int32_t i = 1, n_width;
+    *pn_npks = 0;
 
-    int32_t final_count = 0;
-    memset(locs, 0, sizeof(int32_t) * 15);
-    for (i = 0; i < count && final_count < max_n; i++)
+    while (i < n_size - 1)
     {
-        bool too_close = false;
-        for (int32_t j = 0; j < final_count; j++)
+        if (pn_x[i] > n_min_height && pn_x[i] > pn_x[i - 1])
         {
-            if (llabs((long)temp_locs[i] - (long)locs[j]) < min_d)
+            n_width = 1;
+            while (i + n_width < n_size && pn_x[i] == pn_x[i + n_width])
+                n_width++;
+            if (pn_x[i] > pn_x[i + n_width] && (*pn_npks) < 15)
             {
-                too_close = true;
-                break;
+                pn_locs[(*pn_npks)++] = i;
+                i += n_width + 1;
             }
+            else
+                i += n_width;
         }
-        if (!too_close)
-        {
-            locs[final_count++] = temp_locs[i];
-        }
+        else
+            i++;
     }
-
-    for (i = 1; i < final_count; i++)
-    {
-        for (int32_t j = i; j > 0 && locs[j] < locs[j - 1]; j--)
-        {
-            int32_t temp = locs[j];
-            locs[j] = locs[j - 1];
-            locs[j - 1] = temp;
-        }
-    }
-
-    *npks = final_count;
 }
 
+// 移除近距离峰值
+static void maxim_remove_close_peaks(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x, int32_t n_min_distance)
+{
+    int32_t i, j, n_old_npks, n_dist;
+
+    maxim_sort_indices_descend(pn_x, pn_locs, *pn_npks);
+
+    for (i = -1; i < *pn_npks; i++)
+    {
+        n_old_npks = *pn_npks;
+        *pn_npks = i + 1;
+        for (j = i + 1; j < n_old_npks; j++)
+        {
+            n_dist = pn_locs[j] - (i == -1 ? -1 : pn_locs[i]);
+            if (n_dist > n_min_distance || n_dist < -n_min_distance)
+                pn_locs[(*pn_npks)++] = pn_locs[j];
+        }
+    }
+
+    maxim_sort_ascend(pn_locs, *pn_npks);
+}
+
+// 找峰值主函数
+static void maxim_find_peaks(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x, int32_t n_size, int32_t n_min_height, int32_t n_min_distance, int32_t n_max_num)
+{
+    maxim_peaks_above_min_height(pn_locs, pn_npks, pn_x, n_size, n_min_height);
+    maxim_remove_close_peaks(pn_locs, pn_npks, pn_x, n_min_distance);
+    *pn_npks = (*pn_npks < n_max_num) ? *pn_npks : n_max_num;
+}
+
+// 心率血氧算法计算
 void Max30102_Algorithm_Calculate(uint32_t *ir_buffer, int32_t buffer_len, uint32_t *red_buffer,
                                   int32_t *spo2, int8_t *spo2_valid,
                                   int32_t *heart_rate, int8_t *hr_valid)
 {
-    static int32_t an_dx[MAX30102_BUFFER_SIZE];
-    static int32_t an_x[MAX30102_BUFFER_SIZE];
-    static float ir_float[MAX30102_BUFFER_SIZE];
-    static float red_float[MAX30102_BUFFER_SIZE];
-    static int32_t last_hr = 0;
+    uint32_t un_ir_mean, un_only_once;
+    int32_t k, n_i_ratio_count;
+    int32_t i, s, m, n_exact_ir_valley_locs_count, n_middle_idx;
+    int32_t n_th1, n_npks, n_c_min;
+    int32_t an_ir_valley_locs[15];
+    int32_t an_exact_ir_valley_locs[15];
+    int32_t n_peak_interval_sum;
 
-    uint32_t ir_mean = 0;
-    int32_t k, n_npks;
-    int32_t peak_locs[15] = {0};
+    int32_t n_y_ac, n_x_ac;
+    int32_t n_spo2_calc;
+    int32_t n_y_dc_max, n_x_dc_max;
+    int32_t n_y_dc_max_idx = 0, n_x_dc_max_idx = 0;
+    int32_t an_ratio[5], n_ratio_average;
+    int32_t n_nume, n_denom;
 
+    // 移除 IR 信号的 DC 分量
+    un_ir_mean = 0;
     for (k = 0; k < buffer_len; k++)
-    {
-        ir_mean += ir_buffer[k];
-    }
-    ir_mean /= buffer_len;
-
+        un_ir_mean += ir_buffer[k];
+    un_ir_mean = un_ir_mean / buffer_len;
     for (k = 0; k < buffer_len; k++)
+        an_x[k] = ir_buffer[k] - un_ir_mean;
+
+    // 4点移动平均
+    for (k = 0; k < buffer_len - MA4_SIZE; k++)
     {
-        an_x[k] = ir_buffer[k] - ir_mean;
+        n_denom = (an_x[k] + an_x[k + 1] + an_x[k + 2] + an_x[k + 3]);
+        an_x[k] = n_denom / 4;
     }
 
-    for (k = 0; k < buffer_len - 8; k++)
+    // 获取平滑后 IR 信号的差分
+    for (k = 0; k < buffer_len - MA4_SIZE - 1; k++)
+        an_dx[k] = (an_x[k + 1] - an_x[k]);
+
+    // 2点移动平均
+    for (k = 0; k < buffer_len - MA4_SIZE - 2; k++)
     {
-        an_x[k] = (an_x[k] + an_x[k + 1] + an_x[k + 2] + an_x[k + 3] +
-                   an_x[k + 4] + an_x[k + 5] + an_x[k + 6] + an_x[k + 7]) /
-                  8;
+        an_dx[k] = (an_dx[k] + an_dx[k + 1]) / 2;
     }
 
-    for (k = 0; k < buffer_len - 9; k++)
+    // Hamming 窗口
+    for (i = 0; i < buffer_len - HAMMING_SIZE - MA4_SIZE - 2; i++)
     {
-        an_dx[k] = an_x[k + 1] - an_x[k];
+        s = 0;
+        for (k = i; k < i + HAMMING_SIZE; k++)
+        {
+            s -= an_dx[k] * auw_hamm[k - i];
+        }
+        an_dx[i] = s / 1146;
     }
 
-    int32_t abs_sum = 0;
-    int32_t data_len = buffer_len - 14;
-    for (k = 0; k < data_len; k++)
+    // 阈值计算
+    n_th1 = 0;
+    for (k = 0; k < buffer_len - HAMMING_SIZE; k++)
     {
-        abs_sum += llabs(an_dx[k]);
+        n_th1 += ((an_dx[k] > 0) ? an_dx[k] : (0 - an_dx[k]));
     }
-    // 使用较低的阈值以更容易检测到峰值
-    int32_t th = abs_sum / data_len;
-    if (th < 10)
-        th = 10; // 设置最小阈值
+    n_th1 = n_th1 / (buffer_len - HAMMING_SIZE);
 
-    ESP_LOGD(TAG, "Peak detection - threshold: %ld, data_len: %ld", (long)th, (long)data_len);
+    // 找峰值
+    maxim_find_peaks(an_dx_peak_locs, &n_npks, an_dx, buffer_len - HAMMING_SIZE, n_th1, 8, 5);
 
-    find_peaks(peak_locs, &n_npks, an_dx, data_len, th, 10, 4);
-
-    ESP_LOGD(TAG, "Peak detection - found %ld peaks", (long)n_npks);
-
+    // 计算心率
+    n_peak_interval_sum = 0;
     if (n_npks >= 2)
     {
-        int32_t intervals[10] = {0}, cnt = 0;
         for (k = 1; k < n_npks; k++)
-        {
-            int32_t interval = peak_locs[k] - peak_locs[k - 1];
-            if (interval > 5 && interval < 50)
-            {
-                intervals[cnt++] = interval;
-            }
-        }
-
-        if (cnt >= 2)
-        {
-            for (int i = 1; i < cnt; i++)
-            {
-                for (int j = i; j > 0 && intervals[j] < intervals[j - 1]; j--)
-                {
-                    int32_t temp = intervals[j];
-                    intervals[j] = intervals[j - 1];
-                    intervals[j - 1] = temp;
-                }
-            }
-
-            int32_t current_hr = 12000 / intervals[cnt / 2];
-
-            if (current_hr >= HEART_RATE_MIN_VALID && current_hr <= HEART_RATE_MAX_VALID)
-            {
-                if (last_hr > 0 && llabs(current_hr - last_hr) > 50)
-                {
-                    current_hr = last_hr;
-                }
-                last_hr = current_hr;
-                *heart_rate = current_hr;
-                *hr_valid = 1;
-            }
-            else
-            {
-                *hr_valid = 0;
-                *spo2_valid = 0;
-                return;
-            }
-        }
-        else
-        {
-            *hr_valid = 0;
-            *spo2_valid = 0;
-            return;
-        }
+            n_peak_interval_sum += (an_dx_peak_locs[k] - an_dx_peak_locs[k - 1]);
+        n_peak_interval_sum = n_peak_interval_sum / (n_npks - 1);
+        *heart_rate = (int32_t)(6000 / n_peak_interval_sum);
+        *hr_valid = 1;
     }
     else
     {
+        *heart_rate = -999;
         *hr_valid = 0;
+    }
+
+    // 计算谷底位置
+    for (k = 0; k < n_npks; k++)
+        an_ir_valley_locs[k] = an_dx_peak_locs[k] + HAMMING_SIZE / 2;
+
+    // 保存原始数据
+    for (k = 0; k < buffer_len; k++)
+    {
+        an_x[k] = ir_buffer[k];
+        an_y[k] = red_buffer[k];
+    }
+
+    // 精确找到谷底位置
+    n_exact_ir_valley_locs_count = 0;
+    for (k = 0; k < n_npks; k++)
+    {
+        un_only_once = 1;
+        m = an_ir_valley_locs[k];
+        n_c_min = 16777216;
+        if (m + 5 < buffer_len - HAMMING_SIZE && m - 5 > 0)
+        {
+            for (i = m - 5; i < m + 5; i++)
+            {
+                if (an_x[i] < n_c_min)
+                {
+                    if (un_only_once > 0)
+                    {
+                        un_only_once = 0;
+                    }
+                    n_c_min = an_x[i];
+                    an_exact_ir_valley_locs[k] = i;
+                }
+            }
+            if (un_only_once == 0)
+                n_exact_ir_valley_locs_count++;
+        }
+    }
+
+    if (n_exact_ir_valley_locs_count < 2)
+    {
+        *spo2 = -999;
         *spo2_valid = 0;
         return;
     }
 
-    for (k = 0; k < buffer_len; k++)
+    // 4点移动平均
+    for (k = 0; k < buffer_len - MA4_SIZE; k++)
     {
-        ir_float[k] = (float)ir_buffer[k];
-        red_float[k] = (float)red_buffer[k];
+        an_x[k] = (an_x[k] + an_x[k + 1] + an_x[k + 2] + an_x[k + 3]) / 4;
+        an_y[k] = (an_y[k] + an_y[k + 1] + an_y[k + 2] + an_y[k + 3]) / 4;
     }
 
-    float spo2_result = max30102_calculate_spo2(ir_float, red_float, (uint16_t)buffer_len);
-    if (spo2_result >= 0.0f && spo2_result <= 100.0f)
+    // 计算比率
+    n_ratio_average = 0;
+    n_i_ratio_count = 0;
+
+    for (k = 0; k < 5; k++)
+        an_ratio[k] = 0;
+
+    for (k = 0; k < n_exact_ir_valley_locs_count - 1; k++)
     {
-        *spo2 = (int32_t)spo2_result;
+        n_y_dc_max = -16777216;
+        n_x_dc_max = -16777216;
+        if (an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k] > 10)
+        {
+            for (i = an_exact_ir_valley_locs[k]; i < an_exact_ir_valley_locs[k + 1]; i++)
+            {
+                if (an_x[i] > n_x_dc_max)
+                {
+                    n_x_dc_max = an_x[i];
+                    n_x_dc_max_idx = i;
+                }
+                if (an_y[i] > n_y_dc_max)
+                {
+                    n_y_dc_max = an_y[i];
+                    n_y_dc_max_idx = i;
+                }
+            }
+
+            n_y_ac = (an_y[an_exact_ir_valley_locs[k + 1]] - an_y[an_exact_ir_valley_locs[k]]) * (n_y_dc_max_idx - an_exact_ir_valley_locs[k]);
+            n_y_ac = an_y[an_exact_ir_valley_locs[k]] + n_y_ac / (an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k]);
+            n_y_ac = an_y[n_y_dc_max_idx] - n_y_ac;
+
+            n_x_ac = (an_x[an_exact_ir_valley_locs[k + 1]] - an_x[an_exact_ir_valley_locs[k]]) * (n_x_dc_max_idx - an_exact_ir_valley_locs[k]);
+            n_x_ac = an_x[an_exact_ir_valley_locs[k]] + n_x_ac / (an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k]);
+            n_x_ac = an_x[n_y_dc_max_idx] - n_x_ac;
+
+            n_nume = (n_y_ac * n_x_dc_max) >> 7;
+            n_denom = (n_x_ac * n_y_dc_max) >> 7;
+
+            if (n_denom > 0 && n_i_ratio_count < 5 && n_nume != 0)
+            {
+                an_ratio[n_i_ratio_count] = (n_nume * 100) / n_denom;
+                n_i_ratio_count++;
+            }
+        }
+    }
+
+    maxim_sort_ascend(an_ratio, n_i_ratio_count);
+    n_middle_idx = n_i_ratio_count / 2;
+
+    if (n_middle_idx > 1)
+        n_ratio_average = (an_ratio[n_middle_idx - 1] + an_ratio[n_middle_idx]) / 2;
+    else
+        n_ratio_average = an_ratio[n_middle_idx];
+
+    if (n_ratio_average > 2 && n_ratio_average < 184)
+    {
+        n_spo2_calc = uch_spo2_table[n_ratio_average];
+        *spo2 = n_spo2_calc;
         *spo2_valid = 1;
     }
     else
     {
+        *spo2 = -999;
         *spo2_valid = 0;
     }
 }
 
+// 任务函数
 void Max30102_Task(void *pvParameters)
 {
     esp_log_level_set("gpio", ESP_LOG_ERROR);
     esp_log_level_set("i2c", ESP_LOG_ERROR);
 
-    uint8_t temp[6];
-    int32_t buf_len = IR_BUF_LEN;
-    uint8_t fifo_wp, fifo_rp;
-    int samples_read, i;
-
-    ESP_LOGI(TAG, "Task started");
-
-    if (bus_handle == NULL)
-    {
-        ESP_LOGE(TAG, "I2C bus not initialized");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    Max30102_Init();
     vTaskDelay(pdMS_TO_TICKS(100));
 
     uint8_t part_id = 0;
     esp_err_t ret = Max30102_Read_Reg(REG_PART_ID, &part_id);
-    if (ret != ESP_OK)
+    if (ret == ESP_OK && part_id == 0x15)
     {
-        ESP_LOGE(TAG, "I2C read failed");
+        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (OK)", part_id);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "WHO_AM_I 读取失败或错误: 0x%02X, err=%d", part_id, ret);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Part ID: 0x%02X", part_id);
 
-    samples_read = 0;
-    ESP_LOGI(TAG, "Collecting initial %ld samples...", (long)buf_len);
+    ESP_LOGI(TAG, "MAX30102 任务启动");
 
-    while (samples_read < buf_len)
-    {
-        Max30102_Read_Reg(REG_FIFO_WR_PTR, &fifo_wp);
-        Max30102_Read_Reg(REG_FIFO_RD_PTR, &fifo_rp);
-
-        if (fifo_wp != fifo_rp)
-        {
-            if (Max30102_Read_Fifo(temp, 6) == ESP_OK)
-            {
-                aun_red_buffer[samples_read] = ((temp[0] & 0x03) << 16) | (temp[1] << 8) | temp[2];
-                aun_ir_buffer[samples_read] = ((temp[3] & 0x03) << 16) | (temp[4] << 8) | temp[5];
-                samples_read++;
-
-                // 每100个样本打印进度
-                if (samples_read % 100 == 0)
-                {
-                    ESP_LOGI(TAG, "Collected %ld/%ld samples", (long)samples_read, (long)buf_len);
-                }
-            }
-        }
-        else
-        {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-    }
-
-    // 打印初始数据的一些统计信息
-    uint32_t ir_min = UINT32_MAX, ir_max = 0;
-    for (int i = 0; i < buf_len; i++)
-    {
-        ir_min = aun_ir_buffer[i] < ir_min ? aun_ir_buffer[i] : ir_min;
-        ir_max = aun_ir_buffer[i] > ir_max ? aun_ir_buffer[i] : ir_max;
-    }
-    ESP_LOGI(TAG, "Initial IR data: min=%lu, max=%lu, range=%lu", ir_min, ir_max, ir_max - ir_min);
-
-    ESP_LOGI(TAG, "Ready for monitoring");
+    uint8_t fifo_buffer[6];
+    int32_t spo2 = 0, heart_rate = 0;
+    int8_t spo2_valid = 0, hr_valid = 0;
 
     while (1)
     {
-        for (i = 100; i < 500; i++)
+        ret = Max30102_Read_Fifo(fifo_buffer, 6);
+        if (ret == ESP_OK)
         {
-            aun_red_buffer[i - 100] = aun_red_buffer[i];
-            aun_ir_buffer[i - 100] = aun_ir_buffer[i];
-        }
+            // 解析数据：IR 和 RED 各 3 字节
+            uint32_t ir_value = ((uint32_t)fifo_buffer[0] << 16) |
+                                ((uint32_t)fifo_buffer[1] << 8) |
+                                (uint32_t)fifo_buffer[2];
+            uint32_t red_value = ((uint32_t)fifo_buffer[3] << 16) |
+                                 ((uint32_t)fifo_buffer[4] << 8) |
+                                 (uint32_t)fifo_buffer[5];
 
-        samples_read = 400;
-        while (samples_read < 500)
-        {
-            vTaskDelay(pdMS_TO_TICKS(2));
-            Max30102_Read_Reg(REG_FIFO_WR_PTR, &fifo_wp);
-            Max30102_Read_Reg(REG_FIFO_RD_PTR, &fifo_rp);
+            // 存储到缓冲区
+            ir_buffer[buffer_idx] = ir_value;
+            red_buffer[buffer_idx] = red_value;
+            buffer_idx++;
 
-            if (fifo_wp != fifo_rp && Max30102_Read_Fifo(temp, 6) == ESP_OK)
+            // 缓冲区满时计算
+            if (buffer_idx >= MAX30102_BUFFER_SIZE)
             {
-                aun_red_buffer[samples_read] = ((temp[0] & 0x03) << 16) | (temp[1] << 8) | temp[2];
-                aun_ir_buffer[samples_read] = ((temp[3] & 0x03) << 16) | (temp[4] << 8) | temp[5];
-                samples_read++;
-            }
-        }
+                Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
+                                             &spo2, &spo2_valid, &heart_rate, &hr_valid);
 
-        Max30102_Algorithm_Calculate(aun_ir_buffer, buf_len, aun_red_buffer, &n_spo2, &ch_spo2_valid, &n_heart_rate, &ch_hr_valid);
+                if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
+                {
+                    last_heart_rate = (uint32_t)heart_rate;
+                    ESP_LOGI(TAG, "心率: %" PRIu32 " bpm", last_heart_rate);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "心率无效: %ld", heart_rate);
+                }
 
-        // 心率有效时打印并发送心率数据
-        if (ch_hr_valid == 1)
-        {
-            ESP_LOGI(TAG, "HR: %ld bpm", (long)n_heart_rate);
+                if (spo2_valid && spo2 >= 0)
+                {
+                    last_spo2 = (uint32_t)spo2;
+                    ESP_LOGI(TAG, "血氧: %" PRIu32 "%%", last_spo2);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "血氧无效: %ld", spo2);
+                }
 
-            // 如果血氧也有效，一起发送
-            if (ch_spo2_valid == 1)
-            {
-                ESP_LOGI(TAG, "SpO2: %ld%%", (long)n_spo2);
-                Message_Queue_Send_Heart_Rate((uint32_t)n_heart_rate, (uint32_t)n_spo2, 0, false);
-            }
-            else
-            {
-                // 只发送心率数据
-                Message_Queue_Send_Heart_Rate((uint32_t)n_heart_rate, 0, 0, false);
+                // 通过消息队列发送心率数据
+                Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
+
+                buffer_idx = 0;
             }
         }
         else
         {
-            // 调试：心率无效时打印状态
-            ESP_LOGD(TAG, "Heart rate invalid - hr_valid: %d, spo2_valid: %d", ch_hr_valid, ch_spo2_valid);
+            ESP_LOGE(TAG, "读取 FIFO 失败: %d", ret);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    vTaskDelete(NULL);
 }
