@@ -6,7 +6,8 @@
 #include "RTC_time.h"
 #include "OLED_Data.h"
 #include "WIFI_manager.h"
-
+#include "MAX30102.h"
+#include "MPU6050.h"
 
 void OLEDShowTask(void *pvParameters);
 

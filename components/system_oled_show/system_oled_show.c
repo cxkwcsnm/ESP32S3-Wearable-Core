@@ -1,8 +1,8 @@
 #include "system_oled_show.h"
 
-
 void OLEDShowTask(void *pvParameters)
 {
+
     while (1)
     {
         float voltage = 0.0f;
@@ -18,7 +18,21 @@ void OLEDShowTask(void *pvParameters)
         oled_show_string(0, 3, "Voltage:");
         oled_show_string(48, 3, voltage_str);
 
-        if(wifi_is_connected())
+        uint32_t heart_rate = Max30102_Get_Heart_Rate();
+        char heart_rate_str[15];
+        if (heart_rate > 0 && heart_rate <= 200)
+        {
+            snprintf(heart_rate_str, sizeof(heart_rate_str), "%lu bpm", heart_rate);
+        }
+        else
+        {
+            snprintf(heart_rate_str, sizeof(heart_rate_str), "-- bpm");
+        }
+        oled_show_string(0, 4, "Heart Rate:");
+        oled_show_string(64, 4, heart_rate_str);
+
+        
+        if (wifi_is_connected())
         {
             oled_draw_image(80, 0, wifiImg.data, wifiImg.width, wifiImg.height);
         }

@@ -13,6 +13,7 @@
 
 #include "system_oled_show.h"
 #include "WIFI_manager.h"
+#include "MessageQueue.h"
 
 #define WIFI_SSID "DESKTOP-HTLNPUV 4127"
 #define WIFI_PASSWORD "88888888"
@@ -41,8 +42,13 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_scan());
     //ESP_ERROR_CHECK(RTC_init());
     ESP_ERROR_CHECK(RTC_init_with_sntp("CST-8"));
-    
+    ESP_ERROR_CHECK(Max30102_Init());
+    ESP_ERROR_CHECK(Mpu6050_Init());
+    ESP_ERROR_CHECK(Message_Queue_Init());
 
+
+    xTaskCreate(Max30102_Task, "Max30102_Task", 4096, NULL, 5, NULL);
     xTaskCreate(wifi_connect_task, "wifi_connect_task", 4096, &wifi_params, 5, NULL);
     xTaskCreate(OLEDShowTask, "OLEDShowTask", 4096, NULL, 5, NULL);
+    xTaskCreate(Message_Queue_Process_Task, "MessageQueueTask", 4096, NULL, 5, NULL);
 }
