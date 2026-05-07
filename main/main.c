@@ -47,7 +47,7 @@ void app_main(void)
 
     xTaskCreate(Max30102_Task, "Max30102_Task", 4096, NULL, 5, NULL);
     xTaskCreate(Task_Mpu6050_Monitor, "Mpu6050_Task", 4096, NULL, 5, NULL);
-    xTaskCreate(wifi_connect_task, "wifi_connect_task", 4096, &wifi_params, 5, NULL);
-    xTaskCreate(OLEDShowTask, "OLEDShowTask", 4096, NULL, 5, NULL);
-    xTaskCreate(Message_Queue_Process_Task, "MessageQueueTask", 4096, NULL, 5, NULL);
+    xTaskCreate(wifi_connect_task, "wifi_connect_task", 4096, &wifi_params, 3, NULL);
+    xTaskCreate(OLEDShowTask, "OLEDShowTask", 4096, NULL, 4, NULL);
+    xTaskCreate(Message_Queue_Process_Task, "MessageQueueTask", 4096, NULL, 2, NULL);
 }

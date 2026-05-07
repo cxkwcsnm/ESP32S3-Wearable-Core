@@ -15,8 +15,9 @@ static volatile uint32_t last_spo2 = 0;
 
 // 测量状态
 static volatile bool measurement_active = false;
-static volatile TickType_t measurement_start_tick = 0;
-#define MEASUREMENT_DURATION_MS 20000
+static volatile uint32_t measurement_elapsed_seconds = 0;
+static volatile bool has_valid_data = false;
+#define MEASUREMENT_DURATION_S 20
 
 // 按键相关
 #define KEY_GPIO_PIN GPIO_NUM_40
@@ -46,41 +47,53 @@ static const uint8_t uch_spo2_table[184] = {
     54, 53, 52, 52, 51, 51, 50, 49, 49, 48, 48, 47, 47, 46, 45, 45, 44, 44, 43, 42};
 
 // 初始化按键GPIO
-static void Max30102_Key_Init(void)
+static esp_err_t Max30102_Key_Init(void)
 {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << KEY_GPIO_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE, // 下降沿触发中断
+        .intr_type = GPIO_INTR_DISABLE,  /* 轮询模式，不需要中断 */
     };
-    gpio_config(&io_conf);
-    ESP_LOGI(TAG, "按键 GPIO%d 初始化完成", KEY_GPIO_PIN);
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "按键 GPIO%d 配置失败: %s", KEY_GPIO_PIN, esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* 验证 GPIO 状态：未按下时应为高电平（内部上拉） */
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int level = gpio_get_level(KEY_GPIO_PIN);
+    ESP_LOGI(TAG, "按键 GPIO%d 初始化完成, 当前电平=%d (期望1=未按下)", KEY_GPIO_PIN, level);
+    return ESP_OK;
 }
 
 // 检查按键是否按下（去抖处理）
 static bool Max30102_Is_Key_Pressed(void)
 {
     static TickType_t last_press_time = 0;
+
+    /* 低电平 = 按下（按键接地） */
+    if (gpio_get_level(KEY_GPIO_PIN) != 0)
+        return false;
+
+    /* 去抖：延时后再确认 */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (gpio_get_level(KEY_GPIO_PIN) != 0)
+        return false;
+
+    /* 在 debounce 之后获取时间戳 */
     TickType_t now = xTaskGetTickCount();
 
-    // 读取按键状态（低电平表示按下）
-    if (gpio_get_level(KEY_GPIO_PIN) == 0)
-    {
-        // 去抖：按键按下后等待20ms再次检测
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (gpio_get_level(KEY_GPIO_PIN) == 0)
-        {
-            // 防重复触发：5秒内只响应一次
-            if (now - last_press_time > pdMS_TO_TICKS(5000))
-            {
-                last_press_time = now;
-                return true;
-            }
-        }
-    }
-    return false;
+    /* 防重复触发：5秒内只响应一次 */
+    if ((now - last_press_time) <= pdMS_TO_TICKS(5000))
+        return false;
+
+    last_press_time = now;
+    ESP_LOGI(TAG, "GPIO%d 按键检测成功! 电平=0", KEY_GPIO_PIN);
+    return true;
 }
 
 // 初始化
@@ -135,7 +148,12 @@ esp_err_t Max30102_Init(void)
         return ret;
 
     // 初始化按键
-    Max30102_Key_Init();
+    ret = Max30102_Key_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "按键初始化失败");
+        return ret;
+    }
 
     ESP_LOGI(TAG, "MAX30102 初始化完成");
     return ESP_OK;
@@ -198,16 +216,16 @@ bool Max30102_Is_Measuring(void)
     return measurement_active;
 }
 
-// 获取测量剩余秒数
-uint32_t Max30102_Get_Remaining_Seconds(void)
+// 获取测量已用秒数
+uint32_t Max30102_Get_Elapsed_Seconds(void)
 {
-    if (!measurement_active)
-        return 0;
-    TickType_t elapsed = xTaskGetTickCount() - measurement_start_tick;
-    uint32_t elapsed_ms = elapsed * portTICK_PERIOD_MS;
-    if (elapsed_ms >= MEASUREMENT_DURATION_MS)
-        return 0;
-    return (MEASUREMENT_DURATION_MS - elapsed_ms) / 1000;
+    return measurement_elapsed_seconds;
+}
+
+// 是否有有效数据可显示
+bool Max30102_Has_Valid_Data(void)
+{
+    return has_valid_data;
 }
 
 // 算法排序函数（升序）
@@ -561,6 +579,9 @@ void Max30102_Task(void *pvParameters)
     int32_t spo2 = 0, heart_rate = 0;
     int8_t spo2_valid = 0, hr_valid = 0;
     int samples_since_calc = 0;
+    int total_samples = 0;
+    TickType_t last_second_tick = 0;
+    int poll_count = 0;
 
     while (1)
     {
@@ -569,15 +590,28 @@ void Max30102_Task(void *pvParameters)
             /* ---- 空闲状态：等待按键 ---- */
             Max30102_Read_And_Store_Samples();
 
+            /* 每5秒打印一次 GPIO 诊断，确认轮询在运行 */
+            if (++poll_count >= 100)  /* 100 * 50ms = 5秒 */
+            {
+                poll_count = 0;
+                ESP_LOGI(TAG, "[轮询] GPIO%d 电平=%d (0=按下, 1=未按下)",
+                         KEY_GPIO_PIN, gpio_get_level(KEY_GPIO_PIN));
+            }
+
             if (Max30102_Is_Key_Pressed())
             {
-                ESP_LOGI(TAG, "按键按下，开始20秒测量，请保持手指不动...");
+                ESP_LOGI(TAG, "========================================");
+                ESP_LOGI(TAG, "按键触发! 开始20秒心率血氧测量");
+                ESP_LOGI(TAG, "请将手指放置在传感器上，保持不动");
+                ESP_LOGI(TAG, "========================================");
                 measurement_active = true;
-                measurement_start_tick = xTaskGetTickCount();
+                measurement_elapsed_seconds = 0;
+                has_valid_data = false;
                 buffer_idx = 0;
                 samples_since_calc = 0;
-                last_heart_rate = 0;
-                last_spo2 = 0;
+                total_samples = 0;
+                last_second_tick = xTaskGetTickCount();
+                /* 不清除上次结果，OLED在算法产出新数据前继续显示旧值 */
             }
 
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -587,37 +621,65 @@ void Max30102_Task(void *pvParameters)
             /* ---- 测量状态：持续采集 + 周期计算 ---- */
             int count = Max30102_Read_And_Store_Samples();
             samples_since_calc += count;
+            total_samples += count;
+
+            /* 每秒更新一次 elapsed_seconds + 打印进度日志 */
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_second_tick) >= pdMS_TO_TICKS(1000))
+            {
+                last_second_tick += pdMS_TO_TICKS(1000);
+                measurement_elapsed_seconds++;
+                ESP_LOGI(TAG, "[进度] %lu/%d 秒 | 已采样 %d 个 | HR=%" PRIu32 " bpm SpO2=%" PRIu32 "%%",
+                         (unsigned long)measurement_elapsed_seconds, MEASUREMENT_DURATION_S,
+                         total_samples, last_heart_rate, last_spo2);
+            }
 
             /* 缓冲区满一次就计算一次（~5秒数据） */
             if (samples_since_calc >= MAX30102_BUFFER_SIZE)
             {
                 samples_since_calc = 0;
+                ESP_LOGI(TAG, "[算法] 缓冲区满 500 样本，开始计算...");
 
                 Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
                                              &spo2, &spo2_valid, &heart_rate, &hr_valid);
 
+                ESP_LOGI(TAG, "[算法] 原始结果: hr_valid=%d heart_rate=%ld spo2_valid=%d spo2=%ld",
+                         hr_valid, (long)heart_rate, spo2_valid, (long)spo2);
+
                 if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
                 {
                     last_heart_rate = (uint32_t)heart_rate;
-                    ESP_LOGI(TAG, "[测量中] 心率: %" PRIu32 " bpm", last_heart_rate);
+                    has_valid_data = true;
+                    ESP_LOGI(TAG, "[结果] 心率更新: %" PRIu32 " bpm", last_heart_rate);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "[结果] 心率无效 (raw=%ld, valid=%d)", (long)heart_rate, hr_valid);
                 }
 
                 if (spo2_valid && spo2 >= 0)
                 {
                     last_spo2 = (uint32_t)spo2;
-                    ESP_LOGI(TAG, "[测量中] 血氧: %" PRIu32 "%%", last_spo2);
+                    has_valid_data = true;
+                    ESP_LOGI(TAG, "[结果] 血氧更新: %" PRIu32 "%%", last_spo2);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "[结果] 血氧无效 (raw=%ld, valid=%d)", (long)spo2, spo2_valid);
                 }
             }
 
             /* 检查20秒是否到期 */
-            TickType_t elapsed = xTaskGetTickCount() - measurement_start_tick;
-            if (elapsed >= pdMS_TO_TICKS(MEASUREMENT_DURATION_MS))
+            if (measurement_elapsed_seconds >= MEASUREMENT_DURATION_S)
             {
                 measurement_active = false;
 
-                ESP_LOGI(TAG, "===== 测量结束 =====");
-                ESP_LOGI(TAG, "最终结果 - 心率: %" PRIu32 " bpm, 血氧: %" PRIu32 "%%",
-                         last_heart_rate, last_spo2);
+                ESP_LOGI(TAG, "========================================");
+                ESP_LOGI(TAG, "测量结束! 最终结果:");
+                ESP_LOGI(TAG, "  心率: %" PRIu32 " bpm", last_heart_rate);
+                ESP_LOGI(TAG, "  血氧: %" PRIu32 "%%", last_spo2);
+                ESP_LOGI(TAG, "  总采样数: %d", total_samples);
+                ESP_LOGI(TAG, "========================================");
 
                 Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
             }
