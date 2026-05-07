@@ -11,7 +11,7 @@ esp_err_t battery_adc_init(void)
         return ESP_OK;  // 防止重复初始化
     }
 
-    // 1️⃣ 创建 ADC 单元句柄（相当于"打开设备"）
+    //  创建 ADC 单元句柄（相当于"打开设备"）
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,              // 使用 ADC1
         .ulp_mode = ADC_ULP_MODE_DISABLE,   // 不需要 ULP 模式
@@ -25,7 +25,7 @@ esp_err_t battery_adc_init(void)
         return ret;
     }
 
-    // 2️⃣ 配置通道参数（分辨率 + 衰减）
+    //  配置通道参数（分辨率 + 衰减）
     adc_oneshot_chan_cfg_t chan_config = {
         .atten = ADC_ATTEN_DB_12,    // 12dB 衰减 → 最大测量 ~3.9V
         .bitwidth = ADC_BITWIDTH_12, // 12位分辨率 → 0~4095
@@ -56,7 +56,7 @@ esp_err_t battery_adc_read(uint32_t *out_value)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 3️⃣ 读取原始值（核心函数）
+    //  读取原始值（核心函数）
     int raw_value;
     esp_err_t ret = adc_oneshot_read(adc1_handle, ADC_CHANNEL_7, &raw_value);
     if (ret != ESP_OK) {
@@ -103,7 +103,7 @@ esp_err_t battery_get_average_voltage(int samples, float *out_voltage)
         } else {
             ESP_LOGW(TAG, "采样 %d 失败: %s", i, esp_err_to_name(ret));
         }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);  // 短暂延迟，避免采样过快
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms 间隔采样
     }
 
     if (valid_samples == 0) {
