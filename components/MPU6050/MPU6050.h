@@ -12,9 +12,11 @@
 #include "myiic.h"
 #include "MessageQueue.h"
 
-// --- 硬件映射 --- 
+// --- 硬件映射 ---
 #define MPU6050_INT_GPIO      -1
 #define MPU6050_ADDR          0x68
+#define MPU6050_WHO_AM_I_VAL  0x68   /* MPU6050 */
+#define MPU6500_WHO_AM_I_VAL  0x70   /* MPU6500 (寄存器兼容) */
 
 // --- 寄存器 ---
 #define MPU6050_REG_WHO_AM_I     0x75

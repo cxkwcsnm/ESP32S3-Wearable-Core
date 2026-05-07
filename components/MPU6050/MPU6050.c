@@ -26,22 +26,45 @@ static int buffer_idx = 0;
 // 初始化
 esp_err_t Mpu6050_Init(void)
 {
+    esp_err_t ret;
+
     // 添加 MPU6050 设备
-    ESP_ERROR_CHECK(myiic_add_device(MPU6050_ADDR, &mpu6050_dev));
+    ret = myiic_add_device(MPU6050_ADDR, &mpu6050_dev);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "添加 MPU6050 设备失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // 软件复位
-    Mpu6050_Write_Reg(MPU6050_REG_PWR_MGMT_1, 0x80);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    ret = Mpu6050_Write_Reg(MPU6050_REG_PWR_MGMT_1, 0x80);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "软件复位失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "软件复位已发送，等待 200ms...");
+    vTaskDelay(pdMS_TO_TICKS(200));  /* 复位后需要更长等待时间 */
 
     // 唤醒，选择陀螺仪时钟
-    Mpu6050_Write_Reg(MPU6050_REG_PWR_MGMT_1, 0x01);
+    ret = Mpu6050_Write_Reg(MPU6050_REG_PWR_MGMT_1, 0x01);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "唤醒失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    Mpu6050_Write_Reg(MPU6050_REG_SMPLRT_DIV, 19);
-    Mpu6050_Write_Reg(MPU6050_REG_CONFIG, 0x05);
-    Mpu6050_Write_Reg(MPU6050_REG_ACCEL_CONFIG, 0x18);
-    Mpu6050_Write_Reg(MPU6050_REG_GYRO_CONFIG, 0x18);
+    ret = Mpu6050_Write_Reg(MPU6050_REG_SMPLRT_DIV, 19);
+    if (ret != ESP_OK) return ret;
+    ret = Mpu6050_Write_Reg(MPU6050_REG_CONFIG, 0x05);
+    if (ret != ESP_OK) return ret;
+    ret = Mpu6050_Write_Reg(MPU6050_REG_ACCEL_CONFIG, 0x18);
+    if (ret != ESP_OK) return ret;
+    ret = Mpu6050_Write_Reg(MPU6050_REG_GYRO_CONFIG, 0x18);
+    if (ret != ESP_OK) return ret;
 
     ESP_LOGI(TAG, "MPU6050 初始化完成");
     return ESP_OK;
@@ -222,15 +245,21 @@ void Task_Mpu6050_Monitor(void *pvParameters)
 
     uint8_t who_am_i = 0;
     esp_err_t ret = Mpu6050_Read_Reg(MPU6050_REG_WHO_AM_I, &who_am_i);
-    if (ret == ESP_OK && who_am_i == MPU6050_ADDR)
+    if (ret != ESP_OK)
     {
-        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (OK)", who_am_i);
+        ESP_LOGE(TAG, "WHO_AM_I 读取失败: %s (设备未响应? 检查接线)", esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return;
     }
+    if (who_am_i == MPU6050_WHO_AM_I_VAL)
+        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (MPU6050 OK)", who_am_i);
+    else if (who_am_i == MPU6500_WHO_AM_I_VAL)
+        ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (MPU6500 OK, 寄存器兼容MPU6050)", who_am_i);
     else
     {
-        ESP_LOGE(TAG, "WHO_AM_I 读取失败或错误: 0x%02X, err=%d", who_am_i, ret);
+        ESP_LOGE(TAG, "WHO_AM_I = 0x%02X, 未知设备 (期望 0x68 或 0x70)", who_am_i);
         vTaskDelete(NULL);
-        //   return;
+        return;
     }
 
     ESP_LOGI(TAG, "开始采集数据 @ ~%d Hz ...", MPU6050_SAMPLES_PER_SEC);

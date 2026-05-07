@@ -1,5 +1,6 @@
 #include "system_oled_show.h"
 
+
 #define MEASUREMENT_TOTAL_SECONDS 20
 #define PROGRESS_BAR_WIDTH 20  /* 字符数，每字符6像素 = 120像素 */
 
@@ -9,14 +10,14 @@ static void oled_show_measurement_screen(void)
 
     oled_show_string(12, 0, "= Measuring =");
 
-    uint32_t hr = Max30102_Get_Heart_Rate();
     char buf[22];
 
-    /* 心率 */
+    /* 心率：有数据时显示数值，否则显示等待提示 */
+    uint32_t hr = Max30102_Get_Heart_Rate();
     if (hr > 0 && hr <= 200)
         snprintf(buf, sizeof(buf), "HR:  %3lu bpm", (unsigned long)hr);
     else
-        snprintf(buf, sizeof(buf), "HR:   -- bpm");
+        snprintf(buf, sizeof(buf), "HR:  ... bpm");
     oled_show_string(0, 2, buf);
 
     /* 血氧 */
@@ -24,21 +25,20 @@ static void oled_show_measurement_screen(void)
     if (spo2 > 0 && spo2 <= 100)
         snprintf(buf, sizeof(buf), "SpO2: %3lu%%", (unsigned long)spo2);
     else
-        snprintf(buf, sizeof(buf), "SpO2:  --%%");
+        snprintf(buf, sizeof(buf), "SpO2: ...%%");
     oled_show_string(0, 3, buf);
 
-    /* 倒计时 */
-    uint32_t remaining = Max30102_Get_Remaining_Seconds();
-    snprintf(buf, sizeof(buf), "Time: %2lus left", (unsigned long)remaining);
+    /* 已用时间 / 总时间 */
+    uint32_t elapsed = Max30102_Get_Elapsed_Seconds();
+    snprintf(buf, sizeof(buf), "%2lu / %ds", (unsigned long)elapsed, MEASUREMENT_TOTAL_SECONDS);
     oled_show_string(0, 5, buf);
 
     /* 进度条 */
-    uint32_t elapsed_s = MEASUREMENT_TOTAL_SECONDS - remaining;
-    int filled = (elapsed_s * PROGRESS_BAR_WIDTH) / MEASUREMENT_TOTAL_SECONDS;
+    int filled = (elapsed * PROGRESS_BAR_WIDTH) / MEASUREMENT_TOTAL_SECONDS;
     if (filled > PROGRESS_BAR_WIDTH)
         filled = PROGRESS_BAR_WIDTH;
 
-    char bar[PROGRESS_BAR_WIDTH + 3]; /* [ + 20 chars + ] + \0 */
+    char bar[PROGRESS_BAR_WIDTH + 3];
     bar[0] = '[';
     for (int i = 0; i < PROGRESS_BAR_WIDTH; i++)
         bar[1 + i] = (i < filled) ? '#' : ' ';
@@ -63,7 +63,7 @@ void OLEDShowTask(void *pvParameters)
 
         float voltage = 0.0f;
         battery_get_average_voltage(5, &voltage); // 采样 5 次，获取平均电压
-        ESP_LOGI("BATTERY", "平均电压: %.2f V", voltage);
+        
 
         char voltage_str[20];
         snprintf(voltage_str, sizeof(voltage_str), "%.2f V", voltage);
@@ -100,6 +100,13 @@ void OLEDShowTask(void *pvParameters)
         oled_show_string(0, 5, "SPO2: ");
         oled_show_string(64, 5, spo2_str);
 
+        int16_t ax, ay, az;
+        Mpu6050_Get_Accel_Data(&ax, &ay, &az);
+        char accel_buf[22];
+        snprintf(accel_buf, sizeof(accel_buf), "X:%+5d Y:%+5d", ax, ay);
+        oled_show_string(0, 6, accel_buf);
+        snprintf(accel_buf, sizeof(accel_buf), "Z:%+5d", az);
+        oled_show_string(0, 7, accel_buf);
 
         if (wifi_is_connected())
         {
