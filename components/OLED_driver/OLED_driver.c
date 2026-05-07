@@ -13,20 +13,17 @@ static esp_err_t oled_i2c_write_raw(const uint8_t *data, size_t len, uint8_t con
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t *write_buf = (uint8_t *)malloc(len + 1);
-    if (write_buf == NULL)
+    /* 控制字节 + 最多128字节数据 (SSD1306 单页最大) */
+    if (len > OLED_WIDTH)
     {
-        ESP_LOGE(TAG, "Failed to allocate memory");
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_INVALID_ARG;
     }
 
+    uint8_t write_buf[OLED_WIDTH + 1];
     write_buf[0] = control;
     memcpy(&write_buf[1], data, len);
 
-    esp_err_t err = myiic_write(s_oled_dev_handle, OLED_ADDR, write_buf, len + 1);
-
-    free(write_buf);
-    return err;
+    return myiic_write(s_oled_dev_handle, OLED_ADDR, write_buf, len + 1);
 }
 
 esp_err_t oled_init(void)

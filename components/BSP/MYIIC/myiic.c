@@ -82,6 +82,11 @@ esp_err_t myiic_deinit(void)
     esp_err_t err = i2c_del_master_bus(bus_handle);
     if (err == ESP_OK)
     {
+        if (i2c_mutex != NULL)
+        {
+            vSemaphoreDelete(i2c_mutex);
+            i2c_mutex = NULL;
+        }
         bus_initialized = false;
         ESP_LOGI(TAG, "I2C总线 反初始化成功");
     }

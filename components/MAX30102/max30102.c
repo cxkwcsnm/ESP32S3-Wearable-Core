@@ -10,8 +10,17 @@ static uint32_t red_buffer[MAX30102_BUFFER_SIZE] = {0};
 static int buffer_idx = 0;
 
 // 计算结果缓存
-static uint32_t last_heart_rate = 0;
-static uint32_t last_spo2 = 0;
+static volatile uint32_t last_heart_rate = 0;
+static volatile uint32_t last_spo2 = 0;
+
+// 测量状态
+static volatile bool measurement_active = false;
+static volatile TickType_t measurement_start_tick = 0;
+#define MEASUREMENT_DURATION_MS 20000
+
+// 按键相关
+#define KEY_GPIO_PIN GPIO_NUM_40
+static bool spo2_measurement_requested = false;
 
 // 算法相关常量
 #define BUFFER_SIZE 500
@@ -35,6 +44,44 @@ static const uint8_t uch_spo2_table[184] = {
     75, 74, 74, 73, 73, 72, 72, 71, 71, 70, 70, 69, 69, 68, 68, 67, 67, 66, 66, 65,
     65, 64, 64, 63, 62, 62, 61, 61, 60, 60, 59, 59, 58, 58, 57, 56, 56, 55, 55, 54,
     54, 53, 52, 52, 51, 51, 50, 49, 49, 48, 48, 47, 47, 46, 45, 45, 44, 44, 43, 42};
+
+// 初始化按键GPIO
+static void Max30102_Key_Init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << KEY_GPIO_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE, // 下降沿触发中断
+    };
+    gpio_config(&io_conf);
+    ESP_LOGI(TAG, "按键 GPIO%d 初始化完成", KEY_GPIO_PIN);
+}
+
+// 检查按键是否按下（去抖处理）
+static bool Max30102_Is_Key_Pressed(void)
+{
+    static TickType_t last_press_time = 0;
+    TickType_t now = xTaskGetTickCount();
+
+    // 读取按键状态（低电平表示按下）
+    if (gpio_get_level(KEY_GPIO_PIN) == 0)
+    {
+        // 去抖：按键按下后等待20ms再次检测
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (gpio_get_level(KEY_GPIO_PIN) == 0)
+        {
+            // 防重复触发：5秒内只响应一次
+            if (now - last_press_time > pdMS_TO_TICKS(5000))
+            {
+                last_press_time = now;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 // 初始化
 esp_err_t Max30102_Init(void)
@@ -87,6 +134,9 @@ esp_err_t Max30102_Init(void)
     if (ret != ESP_OK)
         return ret;
 
+    // 初始化按键
+    Max30102_Key_Init();
+
     ESP_LOGI(TAG, "MAX30102 初始化完成");
     return ESP_OK;
 }
@@ -104,19 +154,18 @@ esp_err_t Max30102_Read_Reg(uint8_t reg, uint8_t *data)
     return myiic_write_read(max30102_dev, MAX30102_ADDR, &reg, 1, data, 1);
 }
 
-// 读取FIFO中可用的样本数
+// 读取FIFO中可用的样本数（一次I2C事务读取3个连续寄存器）
 static int Max30102_Get_Fifo_Count(void)
 {
-    uint8_t wr_ptr, rd_ptr, ovf;
+    uint8_t regs[3];
+    uint8_t reg_addr = REG_FIFO_WR_PTR; // 0x04, 后续为 0x05(OVF) 和 0x06(RD_PTR)
 
-    if (Max30102_Read_Reg(REG_FIFO_WR_PTR, &wr_ptr) != ESP_OK)
-        return 0;
-    if (Max30102_Read_Reg(REG_FIFO_RD_PTR, &rd_ptr) != ESP_OK)
-        return 0;
-    if (Max30102_Read_Reg(REG_OVF_COUNTER, &ovf) != ESP_OK)
+    if (myiic_write_read(max30102_dev, MAX30102_ADDR, &reg_addr, 1, regs, 3) != ESP_OK)
         return 0;
 
-    // 计算FIFO中可用样本数
+    uint8_t wr_ptr = regs[0];
+    uint8_t rd_ptr = regs[2];
+
     int count = wr_ptr - rd_ptr;
     if (count < 0)
         count += 32; // FIFO深度为32
@@ -141,6 +190,24 @@ uint32_t Max30102_Get_Heart_Rate(void)
 uint32_t Max30102_Get_Spo2(void)
 {
     return last_spo2;
+}
+
+// 获取测量状态
+bool Max30102_Is_Measuring(void)
+{
+    return measurement_active;
+}
+
+// 获取测量剩余秒数
+uint32_t Max30102_Get_Remaining_Seconds(void)
+{
+    if (!measurement_active)
+        return 0;
+    TickType_t elapsed = xTaskGetTickCount() - measurement_start_tick;
+    uint32_t elapsed_ms = elapsed * portTICK_PERIOD_MS;
+    if (elapsed_ms >= MEASUREMENT_DURATION_MS)
+        return 0;
+    return (MEASUREMENT_DURATION_MS - elapsed_ms) / 1000;
 }
 
 // 算法排序函数（升序）
@@ -432,6 +499,42 @@ void Max30102_Algorithm_Calculate(uint32_t *ir_buffer, int32_t buffer_len, uint3
     }
 }
 
+// 从FIFO读取并解析样本到缓冲区
+static int Max30102_Read_And_Store_Samples(void)
+{
+    int sample_count = Max30102_Get_Fifo_Count();
+    if (sample_count <= 0)
+        return 0;
+
+    if (sample_count > 16)
+        sample_count = 16;
+
+    uint8_t fifo_buffer[96];
+    esp_err_t ret = Max30102_Read_Fifo(fifo_buffer, sample_count * 6);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "读取 FIFO 失败: %d", ret);
+        return 0;
+    }
+
+    for (int s = 0; s < sample_count; s++)
+    {
+        int offset = s * 6;
+        uint32_t ir_value = ((uint32_t)fifo_buffer[offset] << 16) |
+                            ((uint32_t)fifo_buffer[offset + 1] << 8) |
+                            (uint32_t)fifo_buffer[offset + 2];
+        uint32_t red_value = ((uint32_t)fifo_buffer[offset + 3] << 16) |
+                             ((uint32_t)fifo_buffer[offset + 4] << 8) |
+                             (uint32_t)fifo_buffer[offset + 5];
+
+        ir_buffer[buffer_idx] = ir_value;
+        red_buffer[buffer_idx] = red_value;
+        buffer_idx = (buffer_idx + 1) % MAX30102_BUFFER_SIZE;
+    }
+
+    return sample_count;
+}
+
 // 任务函数
 void Max30102_Task(void *pvParameters)
 {
@@ -453,83 +556,73 @@ void Max30102_Task(void *pvParameters)
         return;
     }
 
-    ESP_LOGI(TAG, "MAX30102 任务启动");
+    ESP_LOGI(TAG, "MAX30102 任务启动 - 按 GPIO%d 键开始20秒血氧测量", KEY_GPIO_PIN);
 
-    uint8_t fifo_buffer[96]; // 最多读取16个样本（每个样本6字节）
     int32_t spo2 = 0, heart_rate = 0;
     int8_t spo2_valid = 0, hr_valid = 0;
+    int samples_since_calc = 0;
 
     while (1)
     {
-        // 获取FIFO中可用的样本数
-        int sample_count = Max30102_Get_Fifo_Count();
-
-        if (sample_count > 0)
+        if (!measurement_active)
         {
-            // 限制单次读取的样本数
-            if (sample_count > 16)
-                sample_count = 16;
+            /* ---- 空闲状态：等待按键 ---- */
+            Max30102_Read_And_Store_Samples();
 
-            ret = Max30102_Read_Fifo(fifo_buffer, sample_count * 6);
-            if (ret == ESP_OK)
+            if (Max30102_Is_Key_Pressed())
             {
-                // 解析所有读取的样本
-                for (int s = 0; s < sample_count; s++)
-                {
-                    int offset = s * 6;
-                    uint32_t ir_value = ((uint32_t)fifo_buffer[offset] << 16) |
-                                        ((uint32_t)fifo_buffer[offset + 1] << 8) |
-                                        (uint32_t)fifo_buffer[offset + 2];
-                    uint32_t red_value = ((uint32_t)fifo_buffer[offset + 3] << 16) |
-                                         ((uint32_t)fifo_buffer[offset + 4] << 8) |
-                                         (uint32_t)fifo_buffer[offset + 5];
+                ESP_LOGI(TAG, "按键按下，开始20秒测量，请保持手指不动...");
+                measurement_active = true;
+                measurement_start_tick = xTaskGetTickCount();
+                buffer_idx = 0;
+                samples_since_calc = 0;
+                last_heart_rate = 0;
+                last_spo2 = 0;
+            }
 
-                    // 存储到缓冲区（循环缓冲）
-                    ir_buffer[buffer_idx] = ir_value;
-                    red_buffer[buffer_idx] = red_value;
-                    buffer_idx = (buffer_idx + 1) % MAX30102_BUFFER_SIZE;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        else
+        {
+            /* ---- 测量状态：持续采集 + 周期计算 ---- */
+            int count = Max30102_Read_And_Store_Samples();
+            samples_since_calc += count;
+
+            /* 缓冲区满一次就计算一次（~5秒数据） */
+            if (samples_since_calc >= MAX30102_BUFFER_SIZE)
+            {
+                samples_since_calc = 0;
+
+                Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
+                                             &spo2, &spo2_valid, &heart_rate, &hr_valid);
+
+                if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
+                {
+                    last_heart_rate = (uint32_t)heart_rate;
+                    ESP_LOGI(TAG, "[测量中] 心率: %" PRIu32 " bpm", last_heart_rate);
+                }
+
+                if (spo2_valid && spo2 >= 0)
+                {
+                    last_spo2 = (uint32_t)spo2;
+                    ESP_LOGI(TAG, "[测量中] 血氧: %" PRIu32 "%%", last_spo2);
                 }
             }
-            else
+
+            /* 检查20秒是否到期 */
+            TickType_t elapsed = xTaskGetTickCount() - measurement_start_tick;
+            if (elapsed >= pdMS_TO_TICKS(MEASUREMENT_DURATION_MS))
             {
-                ESP_LOGE(TAG, "读取 FIFO 失败: %d", ret);
+                measurement_active = false;
+
+                ESP_LOGI(TAG, "===== 测量结束 =====");
+                ESP_LOGI(TAG, "最终结果 - 心率: %" PRIu32 " bpm, 血氧: %" PRIu32 "%%",
+                         last_heart_rate, last_spo2);
+
+                Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
             }
+
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
-
-        // 缓冲区填满后进行计算
-        static int calc_count = 0;
-        calc_count += sample_count;
-        if (calc_count >= MAX30102_BUFFER_SIZE)
-        {
-            calc_count = 0;
-
-            Max30102_Algorithm_Calculate(ir_buffer, MAX30102_BUFFER_SIZE, red_buffer,
-                                         &spo2, &spo2_valid, &heart_rate, &hr_valid);
-
-            if (hr_valid && heart_rate >= HEART_RATE_MIN_VALID && heart_rate <= HEART_RATE_MAX_VALID)
-            {
-                last_heart_rate = (uint32_t)heart_rate;
-                ESP_LOGI(TAG, "心率: %" PRIu32 " bpm", last_heart_rate);
-            }
-            else
-            {
-                ESP_LOGW(TAG, "心率无效: %ld", heart_rate);
-            }
-
-            if (spo2_valid && spo2 >= 0)
-            {
-                last_spo2 = (uint32_t)spo2;
-                ESP_LOGI(TAG, "血氧: %" PRIu32 "%%", last_spo2);
-            }
-            else
-            {
-                ESP_LOGW(TAG, "血氧无效: %ld", spo2);
-            }
-
-            // 通过消息队列发送心率数据
-            Message_Queue_Send_Heart_Rate(last_heart_rate, last_spo2, 0, false);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
