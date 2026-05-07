@@ -45,6 +45,8 @@ esp_err_t Max30102_Read_Fifo(uint8_t *buffer, uint8_t count);
 
 uint32_t Max30102_Get_Heart_Rate(void);
 uint32_t Max30102_Get_Spo2(void);
+bool Max30102_Is_Measuring(void);
+uint32_t Max30102_Get_Remaining_Seconds(void);
 
 void Max30102_Algorithm_Calculate(uint32_t *ir_buffer, int32_t buffer_len, uint32_t *red_buffer,
                                   int32_t *spo2, int8_t *spo2_valid,

@@ -1,10 +1,66 @@
 #include "system_oled_show.h"
 
+#define MEASUREMENT_TOTAL_SECONDS 20
+#define PROGRESS_BAR_WIDTH 20  /* 字符数，每字符6像素 = 120像素 */
+
+static void oled_show_measurement_screen(void)
+{
+    oled_clear_buffer();
+
+    oled_show_string(12, 0, "= Measuring =");
+
+    uint32_t hr = Max30102_Get_Heart_Rate();
+    char buf[22];
+
+    /* 心率 */
+    if (hr > 0 && hr <= 200)
+        snprintf(buf, sizeof(buf), "HR:  %3lu bpm", (unsigned long)hr);
+    else
+        snprintf(buf, sizeof(buf), "HR:   -- bpm");
+    oled_show_string(0, 2, buf);
+
+    /* 血氧 */
+    uint32_t spo2 = Max30102_Get_Spo2();
+    if (spo2 > 0 && spo2 <= 100)
+        snprintf(buf, sizeof(buf), "SpO2: %3lu%%", (unsigned long)spo2);
+    else
+        snprintf(buf, sizeof(buf), "SpO2:  --%%");
+    oled_show_string(0, 3, buf);
+
+    /* 倒计时 */
+    uint32_t remaining = Max30102_Get_Remaining_Seconds();
+    snprintf(buf, sizeof(buf), "Time: %2lus left", (unsigned long)remaining);
+    oled_show_string(0, 5, buf);
+
+    /* 进度条 */
+    uint32_t elapsed_s = MEASUREMENT_TOTAL_SECONDS - remaining;
+    int filled = (elapsed_s * PROGRESS_BAR_WIDTH) / MEASUREMENT_TOTAL_SECONDS;
+    if (filled > PROGRESS_BAR_WIDTH)
+        filled = PROGRESS_BAR_WIDTH;
+
+    char bar[PROGRESS_BAR_WIDTH + 3]; /* [ + 20 chars + ] + \0 */
+    bar[0] = '[';
+    for (int i = 0; i < PROGRESS_BAR_WIDTH; i++)
+        bar[1 + i] = (i < filled) ? '#' : ' ';
+    bar[1 + PROGRESS_BAR_WIDTH] = ']';
+    bar[2 + PROGRESS_BAR_WIDTH] = '\0';
+    oled_show_string(4, 7, bar);
+
+    oled_refresh();
+}
+
 void OLEDShowTask(void *pvParameters)
 {
 
     while (1)
     {
+        if (Max30102_Is_Measuring())
+        {
+            oled_show_measurement_screen();
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         float voltage = 0.0f;
         battery_get_average_voltage(5, &voltage); // 采样 5 次，获取平均电压
         ESP_LOGI("BATTERY", "平均电压: %.2f V", voltage);
@@ -44,7 +100,7 @@ void OLEDShowTask(void *pvParameters)
         oled_show_string(0, 5, "SPO2: ");
         oled_show_string(64, 5, spo2_str);
 
-        
+
         if (wifi_is_connected())
         {
             oled_draw_image(80, 0, wifiImg.data, wifiImg.width, wifiImg.height);
